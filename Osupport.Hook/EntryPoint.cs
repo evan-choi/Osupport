@@ -33,7 +33,8 @@ namespace Osupport.Hook
             IntPtr lpEnvironment,
             [MarshalAs(UnmanagedType.LPTStr)] string lpCurrentDirectory,
             IntPtr lpStartupInfo,
-            IntPtr lpProcessInformation);
+            IntPtr lpProcessInformation
+        );
 
         private LocalHook _hook;
         private readonly HookProxy _proxy;
