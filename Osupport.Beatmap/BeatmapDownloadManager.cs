@@ -18,9 +18,15 @@ namespace Osupport.Beatmap
 
             if (option?.Progress != null)
             {
+                int progress = -1;
+
                 client.DownloadProgressChanged += (sender, args) =>
                 {
-                    option.Progress.Report(args.ProgressPercentage / 100d);
+                    if (progress >= args.ProgressPercentage)
+                        return;
+
+                    progress = args.ProgressPercentage;
+                    option.Progress.Report(progress / 100d);
                 };
             }
 

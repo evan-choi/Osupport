@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using EasyHook;
 using Osupport.Beatmap;
 using Osupport.Hook;
+using Serilog;
 
 namespace Osupport
 {
@@ -32,6 +33,7 @@ namespace Osupport
         private readonly SynchronizationContext _synchronizationContext;
 
         private Thread _downloadThread;
+        private CancellationTokenSource _downloadCancellationTokenSource;
         private BlockingCollection<BeatmapDownloadTask> _downloadTasks;
 
         public BeatmapDownloadService(Process process, IBeatmapProvider beatmapProvider)
@@ -57,62 +59,92 @@ namespace Osupport
             string channelName = null;
 
             RemoteHooking.IpcCreateServer(ref channelName, WellKnownObjectMode.SingleCall, _hookProxy);
+            Log.Verbose("{channel} ipc channel created", channelName);
+
             RemoteHooking.Inject(_process.Id, hookDll, hookDll, channelName);
+            Log.Verbose("Inject {dll} to {target} process({pid})", hookDll, _process.ProcessName, _process.Id);
 
             _downloadThread = new Thread(DownloadProc);
-            _downloadTasks = new BlockingCollection<BeatmapDownloadTask>();
-
             _downloadThread.Start();
         }
 
         private void DownloadProc()
         {
-            foreach (var task in _downloadTasks.GetConsumingEnumerable())
+            _downloadCancellationTokenSource = new CancellationTokenSource();
+            _downloadTasks ??= new BlockingCollection<BeatmapDownloadTask>();
+
+            try
             {
-                IBeatmapInfo beatmapInfo = null;
-
-                try
+                while (!_downloadCancellationTokenSource.IsCancellationRequested)
                 {
-                    Task<IBeatmapInfo> infoTask = task.IsBeatmapSet ?
-                        _beatmapProvider.LookupBySetIdAsync(task.Id) :
-                        _beatmapProvider.LookupByIdAsync(task.Id);
-
-                    beatmapInfo = infoTask.Result ?? throw new BeatmapNotFoundException(task.Id);
-
-                    DownloadStarted?.Invoke(this, new BeatmapDownloadEventArgs(beatmapInfo));
-
-                    var option = new BeatmapDownloadOption();
-
-                    if (DownloadProgressChanged != null)
-                        option.Progress = new PropagateHandler(this, beatmapInfo);
-
-                    var result = _beatmapProvider.DownloadAsync(beatmapInfo, option).Result;
-
-                    if (result.Exception != null)
-                        throw result.Exception;
-
-                    DownloadCompleted?.Invoke(this, new BeatmapDownloadEventArgs(beatmapInfo));
-
-                    if (File.Exists(_process.MainModule?.FileName))
+                    while (_downloadTasks.TryTake(out var task, 1000, _downloadCancellationTokenSource.Token))
                     {
-                        Process.Start(_process.MainModule.FileName, result.FilePath);
+                        if (_downloadCancellationTokenSource.IsCancellationRequested)
+                            break;
+
+                        RunTask(task);
                     }
                 }
-                catch (Exception e)
+            }
+            catch (OperationCanceledException)
+            {
+                // Skip
+            }
+        }
+
+        private void RunTask(BeatmapDownloadTask task)
+        {
+            Log.Verbose("Detect {name} {id} downloading",
+                task.IsBeatmapSet ? "beatmapset" : "beatmap",
+                task.Id);
+
+            IBeatmapInfo beatmapInfo = null;
+
+            try
+            {
+                Task<IBeatmapInfo> infoTask = task.IsBeatmapSet ?
+                    _beatmapProvider.LookupBySetIdAsync(task.Id) :
+                    _beatmapProvider.LookupByIdAsync(task.Id);
+
+                beatmapInfo = infoTask.Result ?? throw new BeatmapNotFoundException(task.Id);
+
+                DownloadStarted?.Invoke(this, new BeatmapDownloadEventArgs(beatmapInfo));
+
+                var option = new BeatmapDownloadOption();
+
+                if (DownloadProgressChanged != null)
+                    option.Progress = new PropagateHandler(this, beatmapInfo);
+
+                var result = _beatmapProvider.DownloadAsync(beatmapInfo, option).Result;
+
+                if (result.Exception != null)
+                    throw result.Exception;
+
+                if (File.Exists(_process.MainModule?.FileName))
                 {
-                    DownloadFailed?.Invoke(this, new BeatmapDownloadFailedEventArgs(beatmapInfo, e));
-
-                    var fallbackUrl = task.IsBeatmapSet ?
-                        $"https://osu.ppy.sh/beatmapsets/{task.Id}" :
-                        $"https://osu.ppy.sh/b/{task.Id}";
-
-                    Process.Start(fallbackUrl);
+                    Process.Start(_process.MainModule!.FileName, result.FilePath);
                 }
+
+                DownloadCompleted?.Invoke(this, new BeatmapDownloadEventArgs(beatmapInfo));
+            }
+            catch (Exception e)
+            {
+                DownloadFailed?.Invoke(this, new BeatmapDownloadFailedEventArgs(beatmapInfo, e));
+
+                var fallbackUrl = task.IsBeatmapSet ?
+                    $"https://osu.ppy.sh/beatmapsets/{task.Id}" :
+                    $"https://osu.ppy.sh/b/{task.Id}";
+
+                Process.Start(fallbackUrl);
             }
         }
 
         private bool OnOnCreateProcess(string application, string command)
         {
+#if DEBUG
+            Log.Verbose("CreateProcessW {app}, {command}", application, command);
+#endif
+
             if (string.IsNullOrEmpty(command))
                 return true;
 
@@ -132,6 +164,9 @@ namespace Osupport
         public void Dispose()
         {
             _downloadTasks.CompleteAdding();
+            _downloadCancellationTokenSource.Cancel();
+
+            _downloadThread?.Join();
             _downloadTasks?.Dispose();
         }
 
